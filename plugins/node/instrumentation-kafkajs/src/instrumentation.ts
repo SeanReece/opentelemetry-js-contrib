@@ -24,6 +24,7 @@ import {
   trace,
   context,
   ROOT_CONTEXT,
+  Attributes,
 } from '@opentelemetry/api';
 import {
   MESSAGINGOPERATIONVALUES_PROCESS,
@@ -32,6 +33,7 @@ import {
   SEMATTRS_MESSAGING_DESTINATION,
   SEMATTRS_MESSAGING_OPERATION,
 } from '@opentelemetry/semantic-conventions';
+import { ATTR_MESSAGING_BATCH_MESSAGE_COUNT } from '@opentelemetry/semantic-conventions/incubating';
 import type * as kafkaJs from 'kafkajs';
 import type {
   EachBatchHandler,
@@ -212,6 +214,7 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
   }
 
   private _getConsumerEachBatchPatch() {
+    const { batchPerTopic } = this.getConfig();
     return (original: ConsumerRunConfig['eachBatch']) => {
       const instrumentation = this;
       return function eachBatch(
@@ -219,58 +222,81 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
         ...args: Parameters<EachBatchHandler>
       ): Promise<void> {
         const payload = args[0];
-        // https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/trace/semantic_conventions/messaging.md#topic-with-multiple-consumers
-        const receivingSpan = instrumentation._startConsumerSpan(
-          payload.batch.topic,
-          undefined,
-          MESSAGINGOPERATIONVALUES_RECEIVE,
-          ROOT_CONTEXT
-        );
-        return context.with(
-          trace.setSpan(context.active(), receivingSpan),
-          () => {
-            const spans = payload.batch.messages.map(
-              (message: KafkaMessage) => {
-                const propagatedContext: Context = propagation.extract(
-                  ROOT_CONTEXT,
-                  message.headers,
-                  bufferTextMapGetter
-                );
-                const spanContext = trace
-                  .getSpan(propagatedContext)
-                  ?.spanContext();
-                let origSpanLink: Link | undefined;
-                if (spanContext) {
-                  origSpanLink = {
-                    context: spanContext,
-                  };
+        if (batchPerTopic) {
+          const propagatedContext: Context = propagation.extract(
+            ROOT_CONTEXT,
+            payload.batch.messages[0].headers,
+            bufferTextMapGetter
+          );
+          const span = instrumentation._startConsumerSpan(
+            payload.batch.topic,
+            payload.batch.messages,
+            MESSAGINGOPERATIONVALUES_PROCESS,
+            propagatedContext
+          );
+
+          const eachMessagePromise = context.with(
+            trace.setSpan(propagatedContext, span),
+            () => {
+              return original!.apply(this, args);
+            }
+          );
+          return instrumentation._endSpansOnPromise([span], eachMessagePromise);
+        } else {
+          // https://github.com/open-telemetry/opentelemetry-specification/blob/master/specification/trace/semantic_conventions/messaging.md#topic-with-multiple-consumers
+          const receivingSpan = instrumentation._startConsumerSpan(
+            payload.batch.topic,
+            undefined,
+            MESSAGINGOPERATIONVALUES_RECEIVE,
+            ROOT_CONTEXT
+          );
+          return context.with(
+            trace.setSpan(context.active(), receivingSpan),
+            () => {
+              const spans = payload.batch.messages.map(
+                (message: KafkaMessage) => {
+                  const propagatedContext: Context = propagation.extract(
+                    ROOT_CONTEXT,
+                    message.headers,
+                    bufferTextMapGetter
+                  );
+                  const spanContext = trace
+                    .getSpan(propagatedContext)
+                    ?.spanContext();
+                  let origSpanLink: Link | undefined;
+                  if (spanContext) {
+                    origSpanLink = {
+                      context: spanContext,
+                    };
+                  }
+                  return instrumentation._startConsumerSpan(
+                    payload.batch.topic,
+                    message,
+                    MESSAGINGOPERATIONVALUES_PROCESS,
+                    undefined,
+                    origSpanLink
+                  );
                 }
-                return instrumentation._startConsumerSpan(
-                  payload.batch.topic,
-                  message,
-                  MESSAGINGOPERATIONVALUES_PROCESS,
-                  undefined,
-                  origSpanLink
-                );
-              }
-            );
-            const batchMessagePromise: Promise<void> = original!.apply(
-              this,
-              args
-            );
-            spans.unshift(receivingSpan);
-            return instrumentation._endSpansOnPromise(
-              spans,
-              batchMessagePromise
-            );
-          }
-        );
+              );
+              const batchMessagePromise: Promise<void> = original!.apply(
+                this,
+                args
+              );
+              spans.unshift(receivingSpan);
+              return instrumentation._endSpansOnPromise(
+                spans,
+                batchMessagePromise
+              );
+            }
+          );
+        }
       };
     };
   }
 
   private _getProducerSendBatchPatch() {
     const instrumentation = this;
+    const { batchPerTopic } = this.getConfig();
     return (original: Producer['sendBatch']) => {
       return function sendBatch(
         this: Producer,
@@ -278,13 +304,18 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
       ): ReturnType<Producer['sendBatch']> {
         const batch = args[0];
         const messages = batch.topicMessages || [];
-        const spans: Span[] = messages
-          .map(topicMessage =>
-            topicMessage.messages.map(message =>
+        const spans: Span[] = messages.flatMap(topicMessage => {
+          if (batchPerTopic) {
+            return instrumentation._startProducerSpan(
+              topicMessage.topic,
+              topicMessage.messages
+            );
+          } else {
+            return topicMessage.messages.map(message =>
               instrumentation._startProducerSpan(topicMessage.topic, message)
-            )
-          )
-          .reduce((acc, val) => acc.concat(val), []);
+            );
+          }
+        });
 
         const origSendResult: Promise<RecordMetadata[]> = original.apply(
           this,
@@ -297,16 +328,23 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
 
   private _getProducerSendPatch() {
     const instrumentation = this;
+    const { batchPerTopic } = this.getConfig();
     return (original: Producer['send']) => {
       return function send(
         this: Producer,
         ...args: Parameters<Producer['send']>
       ): ReturnType<Producer['send']> {
         const record = args[0];
-        const spans: Span[] = record.messages.map(message => {
-          return instrumentation._startProducerSpan(record.topic, message);
-        });
-
+        let spans: Span[];
+        if (batchPerTopic) {
+          spans = [
+            instrumentation._startProducerSpan(record.topic, record.messages),
+          ];
+        } else {
+          spans = record.messages.map(message => {
+            return instrumentation._startProducerSpan(record.topic, message);
+          });
+        }
         const origSendResult: Promise<RecordMetadata[]> = original.apply(
           this,
           args
@@ -346,20 +384,25 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
 
   private _startConsumerSpan(
     topic: string,
-    message: KafkaMessage | undefined,
+    message: KafkaMessage | KafkaMessage[] | undefined,
     operation: string,
     context: Context | undefined,
     link?: Link
   ) {
+    const isBatch = Array.isArray(message);
+    const attributes: Attributes = {
+      [SEMATTRS_MESSAGING_SYSTEM]: 'kafka',
+      [SEMATTRS_MESSAGING_DESTINATION]: topic,
+      [SEMATTRS_MESSAGING_OPERATION]: operation,
+    };
+    if (isBatch) {
+      attributes[ATTR_MESSAGING_BATCH_MESSAGE_COUNT] = message.length;
+    }
     const span = this.tracer.startSpan(
       topic,
       {
         kind: SpanKind.CONSUMER,
-        attributes: {
-          [SEMATTRS_MESSAGING_SYSTEM]: 'kafka',
-          [SEMATTRS_MESSAGING_DESTINATION]: topic,
-          [SEMATTRS_MESSAGING_OPERATION]: operation,
-        },
+        attributes,
         links: link ? [link] : [],
       },
       context
@@ -368,7 +411,10 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
     const { consumerHook } = this.getConfig();
     if (consumerHook && message) {
       safeExecuteInTheMiddle(
-        () => consumerHook(span, { topic, message }),
+        () =>
+          isBatch
+            ? consumerHook(span, { topic, messages: message })
+            : consumerHook(span, { topic, message }),
         e => {
           if (e) this._diag.error('consumerHook error', e);
         },
@@ -379,22 +425,31 @@ export class KafkaJsInstrumentation extends InstrumentationBase<KafkaJsInstrumen
     return span;
   }
 
-  private _startProducerSpan(topic: string, message: Message) {
+  private _startProducerSpan(topic: string, message: Message | Message[]) {
+    const isBatch = Array.isArray(message);
+    const attributes: Attributes = {
+      [SEMATTRS_MESSAGING_SYSTEM]: 'kafka',
+      [SEMATTRS_MESSAGING_DESTINATION]: topic,
+    };
+    if (isBatch) {
+      attributes[ATTR_MESSAGING_BATCH_MESSAGE_COUNT] = message.length;
+    }
     const span = this.tracer.startSpan(topic, {
       kind: SpanKind.PRODUCER,
-      attributes: {
-        [SEMATTRS_MESSAGING_SYSTEM]: 'kafka',
-        [SEMATTRS_MESSAGING_DESTINATION]: topic,
-      },
+      attributes,
     });
 
-    message.headers = message.headers ?? {};
-    propagation.inject(trace.setSpan(context.active(), span), message.headers);
+    const headers = isBatch ? message[0].headers ?? {} : message.headers ?? {};
+
+    propagation.inject(trace.setSpan(context.active(), span), headers);
 
     const { producerHook } = this.getConfig();
     if (producerHook) {
       safeExecuteInTheMiddle(
-        () => producerHook(span, { topic, message }),
+        () =>
+          isBatch
+            ? producerHook(span, { topic, messages: message })
+            : producerHook(span, { topic, message }),
         e => {
           if (e) this._diag.error('producerHook error', e);
         },

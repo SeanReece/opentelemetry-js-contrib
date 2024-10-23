@@ -46,6 +46,7 @@ You can set the following:
 | ---------------------------- | -------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
 | `producerHook`               | `KafkaProducerCustomAttributeFunction` | Function called before a producer message is sent. Allows for adding custom attributes to the span.                  |
 | `consumerHook`               | `KafkaConsumerCustomAttributeFunction` | Function called before a consumer message is processed. Allows for adding custom attributes to the span.             |
+| `batchPerTopic`               | `boolean` | Option to emit a span per topic on batch operations instead of per message.             |
 
 ## Semantic Conventions
 
@@ -58,6 +59,7 @@ Attributes collected:
 | `messaging.system`           | An identifier for the messaging system being used.    |
 | `messaging.destination`      | The message destination name.                         |
 | `messaging.operation`        | A string identifying the kind of messaging operation. |
+| `messaging.batch.message_count`        | The number of messages sent or received. Only set when batchPerTopic config is enabled. |
 
 ## Useful links
 

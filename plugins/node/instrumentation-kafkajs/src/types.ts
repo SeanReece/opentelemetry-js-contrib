@@ -15,26 +15,19 @@
  */
 import { Span } from '@opentelemetry/api';
 import { InstrumentationConfig } from '@opentelemetry/instrumentation';
+import { Message, TopicMessages } from 'kafkajs';
 
-export interface KafkajsMessage {
-  key?: Buffer | string | null;
-  value: Buffer | string | null;
-  partition?: number;
-  headers?: Record<string, Buffer | string | (Buffer | string)[] | undefined>;
-  timestamp?: string;
-}
-
-export interface MessageInfo<T = KafkajsMessage> {
+export interface MessageInfo {
   topic: string;
-  message: T;
+  message: Message;
 }
 
-export interface KafkaProducerCustomAttributeFunction<T = KafkajsMessage> {
-  (span: Span, info: MessageInfo<T>): void;
+export interface KafkaProducerCustomAttributeFunction {
+  (span: Span, info: MessageInfo | TopicMessages): void;
 }
 
-export interface KafkaConsumerCustomAttributeFunction<T = KafkajsMessage> {
-  (span: Span, info: MessageInfo<T>): void;
+export interface KafkaConsumerCustomAttributeFunction<T = Message> {
+  (span: Span, info: MessageInfo | TopicMessages): void;
 }
 
 export interface KafkaJsInstrumentationConfig extends InstrumentationConfig {
@@ -43,4 +36,7 @@ export interface KafkaJsInstrumentationConfig extends InstrumentationConfig {
 
   /** hook for adding custom attributes before consumer message is processed */
   consumerHook?: KafkaConsumerCustomAttributeFunction;
+
+  /** Option to emit a span per topic on batch operations instead of per message */
+  batchPerTopic?: boolean;
 }
